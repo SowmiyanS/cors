@@ -1,49 +1,126 @@
-// Listen on a specific host via the HOST environment variable
-var host = process.env.HOST || '0.0.0.0';
-// Listen on a specific port via the PORT environment variable
-var port = process.env.PORT || 3000;
 
-// Grab the blacklist from the command-line so that we can update the blacklist without deploying
-// again. CORS Anywhere is open by design, and this blacklist is not used, except for countering
-// immediate abuse (e.g. denial of service). If you want to block all origins except for some,
-// use originWhitelist instead.
-var originBlacklist = parseEnvList(process.env.CORSANYWHERE_BLACKLIST);
-var originWhitelist = parseEnvList(process.env.CORSANYWHERE_WHITELIST);
-function parseEnvList(env) {
-  if (!env) {
-    return [];
-  }
-  return env.split(',');
+require('dotenv').config({silent : true});
+var http = require('http');
+var request = require('request');
+
+var urlRegex = /^https?/;
+var sizeLimit = process.env.SIZE_LIMIT || 512 * 1024;
+var requestsLimit = process.env.REQ_LIMIT || 15;
+var copyHeaders = ['user-agent', 'content-type'];
+var reqIPs = [];
+
+
+function createRequesHeaders(headers) {
+  var res = {};
+
+  Object.keys(headers).forEach(function(header) {
+    if (copyHeaders.indexOf(header) !== -1) {
+      res[header] = headers[header];
+    }
+  });
+
+  return res;
 }
 
-// Set up rate-limiting to avoid abuse of the public CORS Anywhere server.
-var checkRateLimit = require('./lib/rate-limit')(process.env.CORSANYWHERE_RATELIMIT);
+var getClientAddress = function (req) {
+        return (req.headers['x-forwarded-for'] || '').split(',')[0]
+        || req.connection.remoteAddress;
+}
 
-var cors_proxy = require('./lib/cors-anywhere');
-cors_proxy.createServer({
-  originBlacklist: originBlacklist,
-  originWhitelist: originWhitelist,
-  requireHeader: ['origin', 'x-requested-with'],
-  checkRateLimit: checkRateLimit,
-  removeHeaders: [
-    'cookie',
-    'cookie2',
-    // Strip Heroku-specific headers
-    'x-request-start',
-    'x-request-id',
-    'via',
-    'connect-time',
-    'total-route-time',
-    // Other Heroku added debug headers
-    // 'x-forwarded-for',
-    // 'x-forwarded-proto',
-    // 'x-forwarded-port',
-  ],
-  redirectSameOrigin: true,
-  httpProxyOptions: {
-    // Do not add X-Forwarded-For, etc. headers, because Heroku already adds it.
-    xfwd: false,
-  },
-}).listen(port, host, function() {
-  console.log('Running CORS Anywhere on ' + host + ':' + port);
-});
+function wrongURI(res) {
+  res.setHeader('Content-type', 'text/html');
+  res.writeHead(404);
+  res.end('<h1>Wrong request.</h1><p>For more info check out the spec:' +
+  ' <a href="https://github.com/messier31/cors-proxy-spec">https://github.com/messier31/cors-proxy-spec</a></p>');
+}
+
+function banner(res) {
+  res.setHeader('Content-type', 'text/html');
+  res.writeHead(200);
+  res.end('<h1>CORS PROXY SERVER</h1><p><a href="https://github.com/messier31/cors-proxy-server">' +
+    'https://github.com/messier31/cors-proxy-server</a></p>');
+}
+
+function limitExceed(res) {
+  res.setHeader('Content-type', 'text/html');
+  res.writeHead(403);
+  res.end('<h1>Limit Exceed.</h1><p>Exceed limit of '+ sizeLimit + ' bytes.</p>');
+}
+
+function limitRequestsBanner(res) {
+  res.setHeader('Content-type', 'text/html');
+  res.writeHead(429);
+  res.end('<h1>Requests Limit.</h1><p>Exceed limit of '+ requestsLimit + ' requests per 10sec.</p>');
+}
+
+function limitRequests(req, time) {
+  var ip = getClientAddress(req);
+
+  reqIPs = reqIPs.filter(function(r) {
+    return r.time > (time - (10000));
+  });
+
+
+  if (reqIPs.filter(function(r) { return r.ip === ip; }).length >= requestsLimit) {
+    return true;
+  }
+
+  reqIPs.push({ ip : ip , time : time});
+
+  return false;
+}
+
+http.createServer(function (req, res) {
+  var url = req.url.slice(1);
+
+  if (!urlRegex.test(url)) {
+    if (url.length < 1) {
+      banner(res);
+    } else {
+      wrongURI(res);
+    }
+    return;
+  }
+
+  var size = 0;
+  var time = new Date();
+
+  if (limitRequests(req, time.getTime()) === true) {
+    limitRequestsBanner(res);
+    return;
+  }
+
+  res.setTimeout(25000);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-type');
+  res.setHeader('Access-Control-Allow-Credentials', false);
+
+  var options = {
+    url : url,
+    encoding: null,
+    headers : createRequesHeaders(req.headers)
+  }
+
+  var client = request(options, function(error, response, body) {
+    if (!error) {
+      res.setHeader('Content-type', response.headers['content-type'] || 'text/plain');
+      res.setHeader('Date', response.headers['date'] || time.toString());
+      res.writeHead(Number(response.statusCode));
+      res.write(body);
+      res.end();
+    } else {
+      res.writeHead(500);
+      res.end('err');
+    }
+  });
+
+  client.on('data', function(chunk) {
+    size += chunk.length;
+     if (size >= sizeLimit) {
+       limitExceed(res);
+       client.abort();
+     }
+  });
+
+}).listen(3000)
